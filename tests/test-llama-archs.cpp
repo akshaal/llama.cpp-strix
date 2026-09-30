@@ -23,6 +23,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdlib>
 
 static bool arch_matches(const std::string & filter, llm_arch arch) {
     if (filter.empty()) {
@@ -65,19 +66,22 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
     // note: Mamba A must be negative (state decay)
     const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
+    const char * audit_fixture = std::getenv("LLAMA_TEST_QWEN4EXP_MTP");
+    const bool flat_head = audit_fixture && std::strcmp(audit_fixture, "flat-head") == 0 &&
+            (std::strcmp(tensor->name, "output.weight") == 0 || std::strstr(tensor->name, ".nextn.shared_head_head.weight"));
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
             float val = dis(gen);
-            tmp[i] = is_ssm_a ? -fabsf(val) : val;
+            tmp[i] = flat_head ? 0.0f : is_ssm_a ? -fabsf(val) : val;
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
             float val = dis(gen);
-            tmp[i] = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(val) : val);
+            tmp[i] = ggml_fp32_to_fp16(flat_head ? 0.0f : is_ssm_a ? -fabsf(val) : val);
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else {
@@ -123,6 +127,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+    const bool audit_mtp = arch == LLM_ARCH_QWEN4EXP && std::getenv("LLAMA_TEST_QWEN4EXP_MTP");
+    if (audit_mtp) {
+        n_layer = 3;
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -465,6 +474,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
+    model_params.load_mtp = std::getenv("LLAMA_TEST_QWEN4EXP_MTP") != nullptr;
     model_params.progress_callback = silent_model_load_progress;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
@@ -704,7 +714,16 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
-            llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+            if (arch == LLM_ARCH_QWEN4EXP && std::getenv("LLAMA_TEST_QWEN4EXP_MTP")) {
+                llama_model_saver ms(model_and_ctx.first.get());
+                ms.add_kv_from_model();
+                // The general saver truncates mixed per-layer arrays to the trunk layer count.
+                ms.add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, std::vector<uint32_t>({ 1, 0, 0 }));
+                ms.add_tensors_from_model();
+                ms.save(path);
+            } else {
+                llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+            }
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
@@ -996,6 +1015,13 @@ int main(int argc, char ** argv) {
     if (stdev <= 0.0f) {
         LOG_ERR("%s: stdev must be > 0\n", __func__);
         return 1;
+    }
+    if (const char * audit_fixture = std::getenv("LLAMA_TEST_QWEN4EXP_MTP")) {
+        if (out.empty() || arch_filter != "^qwen4exp$" ||
+                (std::strcmp(audit_fixture, "random") != 0 && std::strcmp(audit_fixture, "flat-head") != 0)) {
+            LOG_ERR("LLAMA_TEST_QWEN4EXP_MTP=random|flat-head requires -a qwen4exp -o <new-fixture-dir>\n");
+            return 1;
+        }
     }
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 

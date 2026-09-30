@@ -19,6 +19,8 @@
 
 #include "raw-reset-preflight.h"
 #include "raw-cleared-spans.h"
+#include "mtp-cache-only-probe.h"
+#include "mtp-cache-only-sampler-probe.h"
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
     llama_batch batch = llama_batch_init(count, 0, 1);
@@ -540,6 +542,22 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
+    }
+
+    if (const char * sampler_probe = std::getenv("LLAMA_TEST_MTP_CACHE_ONLY_SAMPLER")) {
+        if (std::strcmp(sampler_probe, "1") != 0 || std::getenv("LLAMA_TEST_MTP_CACHE_ONLY") ||
+                std::getenv("LLAMA_CLEARED_SPANS_INPUT") || std::getenv("LLAMA_CLEARED_SPANS_OUT") ||
+                std::getenv("LLAMA_RESET_PREFLIGHT_INPUT") || std::getenv("LLAMA_RESET_PREFLIGHT_OUT")) { return 1; }
+        ggml_backend_load_all();
+        return mtp_cache_sampler_probe::run(params);
+    }
+
+    if (const char * mtp_probe = std::getenv("LLAMA_TEST_MTP_CACHE_ONLY")) {
+        if (std::strcmp(mtp_probe, "1") != 0 || std::getenv("LLAMA_CLEARED_SPANS_INPUT") ||
+                std::getenv("LLAMA_CLEARED_SPANS_OUT") || std::getenv("LLAMA_RESET_PREFLIGHT_INPUT") ||
+                std::getenv("LLAMA_RESET_PREFLIGHT_OUT")) { return 1; }
+        ggml_backend_load_all();
+        return mtp_cache_probe::run(params);
     }
 
     const char * spans_input = std::getenv("LLAMA_CLEARED_SPANS_INPUT");
