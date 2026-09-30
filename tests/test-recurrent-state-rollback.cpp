@@ -5,6 +5,7 @@
 
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid-idx.h"
 
 #include <algorithm>
 #include <clocale>
@@ -304,6 +305,16 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+static bool check_qsa_mode(llama_context * ctx, bool expect_pooled, const char * stage) {
+    const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx));
+    const bool pooled = mem != nullptr && mem->get_pooled_rows() > 0;
+    if (mem == nullptr || pooled != expect_pooled || (expect_pooled && mem->pooled_valid(0) <= 0)) {
+        fprintf(stderr, "%s : %s did not use %s QSA\n", __func__, stage, expect_pooled ? "pooled" : "full-recompute");
+        return false;
+    }
+    return true;
+}
+
 static int test_rollback(const common_params & params, llama_model * model, uint8_t fill, uint32_t n_prompt = 0) {
     const bool sparse_qsa = n_prompt > 0;
     const llama_vocab * vocab   = llama_model_get_vocab(model);
@@ -365,6 +376,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         fprintf(stderr, "%s : failed to decode prompt\n", __func__);
         return 1;
     }
+    if (sparse_qsa && !check_qsa_mode(ctx_src, true, "source prefill")) {
+        return 1;
+    }
     if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1)) {
         fprintf(stderr, "%s : rollback failed\n", __func__);
         return 1;
@@ -391,6 +405,11 @@ static int test_rollback(const common_params & params, llama_model * model, uint
             if (!decode_one(ctx_src, tokens[pos], pos) ||
                 !decode_one(ctx_dst, tokens[pos], pos)) {
                 fprintf(stderr, "%s : %s replay failed at position %d\n", __func__, mode, pos);
+                return false;
+            }
+
+            if (sparse_qsa && (!check_qsa_mode(ctx_src, true, "source replay") ||
+                               !check_qsa_mode(ctx_dst, false, "reference replay"))) {
                 return false;
             }
 
@@ -458,6 +477,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         fprintf(stderr, "%s : dirty prompt decode failed\n", __func__);
         return 1;
     }
+    if (sparse_qsa && !check_qsa_mode(ctx_dirty, true, "restore prefill")) {
+        return 1;
+    }
     if (!llama_memory_seq_rm(llama_get_memory(ctx_dirty), 0, rollback_pos, -1)) {
         fprintf(stderr, "%s : dirty rollback failed\n", __func__);
         return 1;
@@ -469,6 +491,10 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         const llama_pos pos = rollback_pos + i;
         if (!decode_one(ctx_dirty, tokens[pos], pos)) {
             fprintf(stderr, "%s : dirty replay failed at position %d\n", __func__, pos);
+            return 1;
+        }
+
+        if (sparse_qsa && !check_qsa_mode(ctx_dirty, true, "restore replay")) {
             return 1;
         }
 
