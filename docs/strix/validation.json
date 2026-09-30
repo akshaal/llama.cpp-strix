@@ -1,0 +1,25 @@
+{
+  "checkpoint": "004",
+  "description": "Selected fields copied from the completed frozen validation records. No new model evaluation was run for publication preparation.",
+  "full_target_logits": {
+    "passed": true,
+    "control_rows": 52,
+    "control_reference_rows": 104,
+    "quality_rows": 4352,
+    "vocabulary": 248320,
+    "all_logit_bytes_equal": true,
+    "gold_nll_difference": 0,
+    "kl_divergence": 0,
+    "conditional_span_perplexity_ratio": 1.0,
+    "scope": "Exact full logits on the saved cleared histories. No universal quality or server/MTP guarantee."
+  },
+  "mtp_real_state": {
+    "passed": true,
+    "states_per_arm": 13,
+    "live_rows_per_arm": 7,
+    "full_KV_metadata_hidden_top10_sampler_state_byte_exact": true,
+    "active_decodes": 4,
+    "backend": "vulkan",
+    "scope": "Real quantized MTP state and backend top-k schedule with synthetic target hidden inputs; no server speed or target-PPL claim."
+  }
+}

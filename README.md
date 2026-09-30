@@ -1,3 +1,13 @@
+# Strix Halo fork: checkpoint 004
+
+This fork preserves a measured Qwen3.8 Flash Next configuration for Strix Halo 128 GB with Vulkan, F16 KV and 210k context.
+
+**Start with the [fork guide](docs/strix/README.md)** for build/run instructions, results, quality limits and AI disclosure. The [patch guide](docs/strix/PATCHES.md) explains the ordered commits and credits the original work. The known cache-reuse probability limitation remains unresolved.
+
+Use branch `strix-checkpoint-004` or tag `checkpoint-004`. The inference source matches the frozen checkpoint. Other hardware and models have not been qualified. The upstream README follows below.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
