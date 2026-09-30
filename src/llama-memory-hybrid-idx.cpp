@@ -183,8 +183,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 break;
             }
 
-            // Image positions can repeat. Keep their full block layout for this context,
-            // including later text batches that still attend to the image cells.
+            // Token batches broadcast one position across M-RoPE axes, including MTP token+embedding batches.
+            // Embedding-only batches can carry image coordinates and retain full pooling for this context.
             bool contiguous = true;
             for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
                 if ((int64_t) ubatch.pos[i] != (int64_t) ubatch.pos[i - 1] + 1) {
@@ -192,7 +192,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                     break;
                 }
             }
-            if (ubatch.is_pos_2d() || ubatch.n_seqs_unq > 1 || !contiguous) {
+            const bool spatial = ubatch.is_pos_2d() && ubatch.token == nullptr;
+            if (spatial || ubatch.n_seqs_unq > 1 || !contiguous) {
                 pooled_text_only = false;
                 pooled_reset(-1);
             }
@@ -386,13 +387,17 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         pooled_reset(seq_id);
 
-        // A state loaded into a fresh context may contain image cells even though this
-        // context has never processed an image batch. Repeated positions need full pooling.
+        // A fresh context can restore image cells. Text positions have equal M-RoPE coordinates and no repeats.
         if (pooled_text_only && !pooled_k.empty()) {
             const auto & cells = mem_idx->get_cells(0);
             std::unordered_set<llama_pos> positions;
             for (uint32_t i = cells.used_min(); i < cells.used_max_p1(); ++i) {
-                if (!cells.is_empty(i) && !positions.insert(cells.pos_get(i)).second) {
+                if (cells.is_empty(i)) {
+                    continue;
+                }
+                const llama_pos p = cells.pos_get(i);
+                const auto & ext = cells.ext_get(i);
+                if (ext.x != p || ext.y != p || !positions.insert(p).second) {
                     pooled_text_only = false;
                     break;
                 }
