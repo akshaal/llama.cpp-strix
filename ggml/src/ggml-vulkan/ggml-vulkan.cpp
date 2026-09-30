@@ -8075,7 +8075,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         mask && mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) &&
         nem0 == KV && nem1 >= N && nem2 == 1 && nem3 == 1 &&
         max_bias == 0.0f && logit_softcap == 0.0f && n_kv_max > 0 &&
-        (int64_t) KV >= std::max<int64_t>(4096, 2 * (int64_t) n_kv_max) &&
+        (int64_t) KV >= std::max<int64_t>(8192, 2 * (int64_t) n_kv_max) &&
         nem1 <= limits.maxComputeWorkGroupCount[0] && nek2 <= limits.maxComputeWorkGroupCount[1] &&
         sparse_prefill_bytes <= limits.maxStorageBufferRange &&
         ggml_nbytes(q) <= UINT32_MAX && ggml_nbytes(k) <= UINT32_MAX &&
