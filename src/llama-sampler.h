@@ -38,6 +38,10 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// An initialized backend chain containing only the built-in, stateless top-k sampler.
+// Its inactive zero-output graph has no sampler state or input updates to preserve.
+bool llama_sampler_chain_is_stateless_top_k(const llama_sampler * sampler);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

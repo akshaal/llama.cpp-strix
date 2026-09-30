@@ -1532,6 +1532,17 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
     );
 }
 
+bool llama_sampler_chain_is_stateless_top_k(const llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+
+    const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
+    return chain->is_init && chain->samplers.size() == 1 &&
+            chain->samplers[0].is_backend &&
+            chain->samplers[0].ptr->iface == &llama_sampler_top_k_i;
+}
+
 // top-p
 
 struct llama_sampler_top_p : public llama_sampler_backend {

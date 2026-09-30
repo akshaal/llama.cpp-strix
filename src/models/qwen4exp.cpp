@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-sampler.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -572,10 +573,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // This setting is fixed for a context's lifetime: graph reuse does not track environment changes.
     const char * cache_only_env = std::getenv("LLAMA_QWEN4EXP_MTP_CACHE_ONLY");
+    // The draft server's top-k-only chain has no inactive reset/input state. Other chains keep the full graph.
+    // split_simple uses one sequence set per token; n_seqs_unq counts actual sequence IDs.
     const bool cache_only = cache_only_env && cache_only_env[0] == '1' && cache_only_env[1] == '\0' &&
             n_outputs == 0 && !cparams.embeddings && cparams.embeddings_nextn &&
-            cparams.embeddings_nextn_masked && ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 &&
-            samplers.empty() && std::none_of(cparams.embeddings_layer_inp.begin(),
+            cparams.embeddings_nextn_masked && ubatch.n_seqs_unq == 1 &&
+            std::all_of(samplers.begin(), samplers.end(), [](const auto & entry) {
+                return llama_sampler_chain_is_stateless_top_k(entry.second);
+            }) && std::none_of(cparams.embeddings_layer_inp.begin(),
                     cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; });
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -638,6 +643,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_build_forward_expand(gf, Kcur);
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        const char * trace = std::getenv("LLAMA_QWEN4EXP_MTP_CACHE_ONLY_TRACE");
+        if (trace && trace[0] == '1' && trace[1] == '\0') {
+            LLAMA_LOG_INFO("MTP_CACHE_ONLY_BUILD tokens=%lld samplers=%zu outputs=0\n",
+                    (long long) n_tokens, samplers.size());
+        }
         return;
     }
 
