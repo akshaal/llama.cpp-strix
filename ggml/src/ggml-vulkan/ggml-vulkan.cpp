@@ -10611,6 +10611,39 @@ void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_REPEAT_BACK, std::move(p));
 }
 
+static void ggml_vk_conv_input_direct(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * graph, int node_idx) {
+    const ggml_tensor * input = graph->nodes[node_idx]->src[0];
+    ggml_tensor * output = graph->nodes[node_idx + 1];
+    const ggml_tensor * history = output->src[0];
+    vk_pipeline pipeline = ctx->device->pipeline_cpy_transpose_32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
+    const vk_subbuffer dst = ggml_vk_tensor_subbuffer(ctx, output, true);
+
+    auto copy = [&](const ggml_tensor * src, uint32_t column_offset) {
+        vk_op_unary_push_constants pc = vk_op_unary_push_constants_init(src, src);
+        pc.nb10 = output->nb[0] / sizeof(uint32_t);
+        pc.nb11 = output->nb[1] / sizeof(uint32_t);
+        pc.nb12 = output->nb[2] / sizeof(uint32_t);
+        pc.nb13 = output->nb[3] / sizeof(uint32_t);
+        init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, output);
+        const uint32_t dst_offset = (pc.misalign_offsets & 0xFFFFu) + column_offset;
+        GGML_ASSERT(dst_offset <= 0xFFFFu);
+        pc.misalign_offsets = (pc.misalign_offsets & 0xFFFF0000u) | dst_offset;
+        const std::array<uint32_t, 3> grid = { CEIL_DIV((uint32_t) src->ne[0], 32), CEIL_DIV((uint32_t) src->ne[1], 32), 1 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, src, true), dst }, pc, grid);
+    };
+
+    // These integer copies write disjoint words in the same output buffer.
+    copy(input, (uint32_t) history->ne[0]);
+    copy(history, 0);
+    if (getenv("GGML_VK_CONV_INPUT_DIRECT_TRACE") != nullptr) {
+        GGML_LOG_INFO("ggml_vulkan: conv-input-direct tokens=%lld channels=%lld history=%lld input_nb=%zu,%zu output_nb=%zu,%zu pipeline=%s grids=%u,%u;1,%u\n",
+                (long long) input->ne[0], (long long) input->ne[1], (long long) history->ne[0],
+                input->nb[0], input->nb[1], output->nb[0], output->nb[1], pipeline->name.c_str(),
+                CEIL_DIV((uint32_t) input->ne[0], 32), CEIL_DIV((uint32_t) input->ne[1], 32), CEIL_DIV((uint32_t) history->ne[1], 32));
+    }
+}
+
 void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ne = (uint32_t)ggml_nelements(src0);
     if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
@@ -12448,7 +12481,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
-        if (ctx->fused_topk_qsa) {
+        if (ctx->fused_conv_input_direct) {
+            ggml_vk_conv_input_direct(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_topk_qsa) {
             ggml_vk_topk_qsa(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_cpy(ctx, compute_ctx, src0, node);
@@ -13855,6 +13890,77 @@ static bool ggml_vk_match_ops(const struct ggml_cgraph * cgraph, int node_idx,
     return true;
 }
 
+static const std::initializer_list<ggml_op> conv_input_direct_pattern = { GGML_OP_CONT, GGML_OP_CONCAT };
+
+static bool ggml_vk_conv_input_direct_layout(const ggml_backend_vk_context * ctx, const ggml_tensor * cont, const ggml_tensor * output) {
+    static const bool disabled = getenv("GGML_VK_CONV_INPUT_DIRECT_DISABLE") != nullptr;
+    if (disabled || ctx->device->disable_fusion || ctx->device->disable_graph_optimize ||
+            ctx->device->vendor_id != VK_VENDOR_ID_AMD || !ctx->device->pipeline_cpy_transpose_32 ||
+            cont->op != GGML_OP_CONT || output->op != GGML_OP_CONCAT || output->src[1] != cont ||
+            ggml_get_op_params_i32(output, 0) != 0 || cont->view_src || (cont->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * input = cont->src[0];
+    const ggml_tensor * history = output->src[0];
+    if (!input || !history || input->op != GGML_OP_TRANSPOSE || !input->src[0] ||
+            input->type != GGML_TYPE_F32 || history->type != GGML_TYPE_F32 ||
+            cont->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(input->src[0]) || !ggml_is_contiguous(history) ||
+            !ggml_is_contiguous(cont) || !ggml_is_contiguous(output)) {
+        return false;
+    }
+    const int64_t tokens = input->ne[0];
+    const int64_t channels = input->ne[1];
+    if (channels != 10240 || tokens < 64 || tokens > UINT32_MAX / channels - 3 ||
+            input->ne[2] != 1 || input->ne[3] != 1 || !ggml_are_same_shape(input, cont) ||
+            history->ne[0] != 3 || history->ne[1] != channels || history->ne[2] != 1 || history->ne[3] != 1 ||
+            output->ne[0] != tokens + 3 || output->ne[1] != channels || output->ne[2] != 1 || output->ne[3] != 1) {
+        return false;
+    }
+    const size_t row_bytes = sizeof(uint32_t) * channels;
+    if (input->nb[0] != row_bytes || input->nb[1] != sizeof(uint32_t) ||
+            input->nb[2] != row_bytes * tokens || input->nb[3] != input->nb[2]) {
+        return false;
+    }
+    const auto & limits = ctx->device->properties.limits;
+    return ggml_nbytes(input) <= limits.maxStorageBufferRange &&
+           ggml_nbytes(history) <= limits.maxStorageBufferRange &&
+           ggml_nbytes(output) <= limits.maxStorageBufferRange &&
+           CEIL_DIV((uint32_t) tokens, 32) <= limits.maxComputeWorkGroupCount[0] &&
+           CEIL_DIV((uint32_t) channels, 32) <= limits.maxComputeWorkGroupCount[1];
+}
+
+static bool ggml_vk_can_fuse_conv_input_direct(ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int node_idx) {
+    if (node_idx + 1 >= graph->n_nodes ||
+            !ggml_vk_conv_input_direct_layout(ctx, graph->nodes[node_idx], graph->nodes[node_idx + 1]) ||
+            !ggml_can_fuse_subgraph(graph, node_idx, conv_input_direct_pattern, { node_idx + 1 }) ||
+            ggml_node_get_use_count(graph, node_idx) != 1) {
+        return false;
+    }
+    const ggml_tensor * input = graph->nodes[node_idx]->src[0];
+    const ggml_tensor * output = graph->nodes[node_idx + 1];
+    const ggml_tensor * history = output->src[0];
+    for (const ggml_tensor * tensor : { input, history, output }) {
+        if (!tensor->buffer || !tensor->data || tensor->buffer->buft != &ctx->device->buffer_type) {
+            return false;
+        }
+        const uint64_t offset = ggml_vk_tensor_buffer_offset(ctx, tensor);
+        const auto * buffer_ctx = static_cast<ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+        const uint64_t size = ggml_nbytes(tensor);
+        if (offset > buffer_ctx->dev_buffer->size || size > buffer_ctx->dev_buffer->size - offset) {
+            return false;
+        }
+        const uint32_t misalign = get_misalign_bytes(ctx, tensor);
+        const uint32_t tail_offset = tensor == output ? 3 : 0;
+        if (misalign % sizeof(uint32_t) != 0 || misalign / sizeof(uint32_t) > 0xFFFFu - tail_offset ||
+                size + misalign > ctx->device->properties.limits.maxStorageBufferRange ||
+                size / sizeof(uint32_t) + misalign / sizeof(uint32_t) > UINT32_MAX) {
+            return false;
+        }
+    }
+    return !ggml_vk_tensors_overlap(input, output, false) && !ggml_vk_tensors_overlap(history, output, false);
+}
+
 static bool ggml_vk_topk_qsa_coalesced_layout(const ggml_backend_vk_context * ctx, const ggml_tensor * cont) {
     static const bool disabled = getenv("GGML_VK_TOPK_QSA_COALESCED_DISABLE") != nullptr;
     const ggml_tensor * input = cont->src[0];
@@ -14350,6 +14456,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_conv_input_direct = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14470,6 +14577,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (ggml_vk_can_fuse_conv_input_direct(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_conv_input_direct = true;
+                fusion_string = "CONV_INPUT_DIRECT";
+                std::fill_n(op_srcs_fused_elementwise, 2, false);
             } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i, true)) {
                 ctx->num_additional_fused_ops = topk_qsa_coalesced_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
@@ -14589,6 +14701,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_conv_input_direct = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -14634,6 +14747,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
+        ctx->fused_conv_input_direct = false;
     }
 
     ctx->last_total_flops = total_flops;
@@ -14826,6 +14940,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (match_pattern(conv_input_direct_pattern, first_unused) &&
+            ggml_vk_conv_input_direct_layout(ctx, graph->nodes[first_unused], graph->nodes[first_unused + 1])) {
+            add_pattern_alloc_deps(conv_input_direct_pattern, first_unused + 1);
+            keep_pattern(conv_input_direct_pattern);
+            continue;
+        }
         if (match_pattern(topk_qsa_coalesced_pattern, first_unused) &&
             ggml_vk_topk_qsa_coalesced_layout(ctx, graph->nodes[first_unused]) &&
             graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused] &&
@@ -14887,7 +15007,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
+            const bool in_conv_input_direct_pattern =
+                (match_pattern(conv_input_direct_pattern, j) &&
+                 ggml_vk_conv_input_direct_layout(ctx, graph->nodes[j], graph->nodes[j + 1])) ||
+                (j > 0 && match_pattern(conv_input_direct_pattern, j - 1) &&
+                 ggml_vk_conv_input_direct_layout(ctx, graph->nodes[j - 1], graph->nodes[j]));
+            if (in_conv_input_direct_pattern || match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
