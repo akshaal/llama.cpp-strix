@@ -537,6 +537,9 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_tps;    // QSA only
     uint32_t n_blocks; // QSA only
     uint32_t n_stream; // QSA only
+    uint32_t score_stride_t;
+    uint32_t score_stride_b;
+    uint32_t score_stride_s;
 };
 
 struct vk_op_im2col_push_constants {

@@ -534,6 +534,12 @@ static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_R
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                    GGML_OP_TOP_K };
 
+// Include the score copy so its strided input is an explicit fusion source.
+static constexpr std::initializer_list<ggml_op> topk_qsa_coalesced_pattern {
+    GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_PERMUTE, GGML_OP_CONT,
+    GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_TOP_K,
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows
     { 2, 0, 1 }, // cont->src[0]    == permute

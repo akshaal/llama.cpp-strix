@@ -11304,7 +11304,7 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
-        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0 };
+        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0, 0, 0, 0 };
         std::array<uint32_t, 3> elements {
             pipeline->wg_denoms[0],
             std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -11423,7 +11423,8 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 }
 
 void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
+    const bool coalesced = cgraph->nodes[node_idx]->op == GGML_OP_CONT;
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + (coalesced ? 1 : 0)];
     const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
     ggml_tensor *       top_k    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
@@ -11456,7 +11457,19 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream };
+    // The coalesced input is the first fused node's direct source, not a dead ancestor.
+    const ggml_tensor * score_input = coalesced ? cgraph->nodes[node_idx]->src[0] : scores;
+    vk_op_topk_radix_push_constants pc {
+        n_kv, width, nrows, n_tps, n_blocks, n_stream,
+        (uint32_t) (score_input->nb[0] / sizeof(float)),
+        (uint32_t) (score_input->nb[1] / sizeof(float)),
+        (uint32_t) (score_input->nb[2] / sizeof(float)),
+    };
+    static const bool trace_coalesced = getenv("GGML_VK_TOPK_QSA_COALESCED_TRACE") != nullptr;
+    if (coalesced && trace_coalesced) {
+        GGML_LOG_INFO("ggml_vulkan: topk-qsa-coalesced blocks=%u kv=%u tokens=%u streams=%u width=%u\n",
+                n_blocks, n_kv, n_tps, n_stream, width);
+    }
     std::array<uint32_t, 3> elements {
         pipeline->wg_denoms[0],
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -11465,7 +11478,7 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
     vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+        { ggml_vk_tensor_subbuffer(ctx, score_input), ggml_vk_tensor_subbuffer(ctx, top_k),
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
           scratch_buf }, pc, elements);
     ctx->prealloc_x_need_sync = true;
@@ -12435,7 +12448,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
-        ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        if (ctx->fused_topk_qsa) {
+            ggml_vk_topk_qsa(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SET_ROWS:
@@ -13838,14 +13855,30 @@ static bool ggml_vk_match_ops(const struct ggml_cgraph * cgraph, int node_idx,
     return true;
 }
 
-bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+static bool ggml_vk_topk_qsa_coalesced_layout(const ggml_backend_vk_context * ctx, const ggml_tensor * cont) {
+    static const bool disabled = getenv("GGML_VK_TOPK_QSA_COALESCED_DISABLE") != nullptr;
+    const ggml_tensor * input = cont->src[0];
+    return !disabled && cont->op == GGML_OP_CONT && cont->type == GGML_TYPE_F32 && cont->ne[0] > 8 &&
+           cont->ne[3] == 1 && input && input->op == GGML_OP_PERMUTE && input->type == GGML_TYPE_F32 &&
+           ggml_are_same_shape(input, cont) &&
+           input->nb[0] == sizeof(float) * cont->ne[1] && input->nb[1] == sizeof(float) &&
+           input->nb[2] == sizeof(float) * cont->ne[0] * cont->ne[1] &&
+           ggml_nelements(input) <= UINT32_MAX &&
+           ggml_nbytes(input) <= ctx->device->properties.limits.maxStorageBufferRange;
+}
+
+bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                               bool with_cont) {
     if (ctx->device->disable_fusion || !ctx->device->pipeline_topk_radix_qsa) {
         return false;
     }
 
-    const int n_ops = topk_qsa_pattern.size();
-    if (!ggml_vk_match_ops(cgraph, node_idx, topk_qsa_pattern) ||
-        !ggml_check_edges(cgraph, node_idx, topk_qsa_edges)) {
+    const auto & pattern = with_cont ? topk_qsa_coalesced_pattern : topk_qsa_pattern;
+    const int n_ops = pattern.size();
+    const int get_rows_idx = node_idx + (with_cont ? 1 : 0);
+    if (!ggml_vk_match_ops(cgraph, node_idx, pattern) ||
+        !ggml_check_edges(cgraph, get_rows_idx, topk_qsa_edges) ||
+        (with_cont && cgraph->nodes[get_rows_idx]->src[0] != cgraph->nodes[node_idx])) {
         return false;
     }
 
@@ -13858,7 +13891,7 @@ bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_
         }
     }
 
-    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * get_rows = cgraph->nodes[get_rows_idx];
     const ggml_tensor * add      = cgraph->nodes[node_idx + n_ops - 2];
     const ggml_tensor * top_k    = cgraph->nodes[node_idx + n_ops - 1];
 
@@ -13896,6 +13929,16 @@ bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_
         top_k->ne[1] != n_tps || top_k->ne[2] != n_stream || top_k->ne[3] != 1 ||
         n_blocks <= 0 || n_kv <= 0 || width <= 0 || width > n_kv) {
         return false;
+    }
+
+    if (with_cont) {
+        if (!ggml_vk_topk_qsa_coalesced_layout(ctx, cgraph->nodes[node_idx])) {
+            return false;
+        }
+        const ggml_tensor * score_input = cgraph->nodes[node_idx]->src[0];
+        if (score_input->buffer == nullptr || get_misalign_bytes(ctx, score_input) != 0) {
+            return false;
+        }
     }
 
     // only worth it in the radix regime; small k uses the faster tournament unfused
@@ -14427,6 +14470,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i, true)) {
+                ctx->num_additional_fused_ops = topk_qsa_coalesced_pattern.size() - 1;
+                ctx->fused_topk_qsa = true;
+                fusion_string = "TOPK_QSA_COALESCED";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
@@ -14778,6 +14826,16 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (match_pattern(topk_qsa_coalesced_pattern, first_unused) &&
+            ggml_vk_topk_qsa_coalesced_layout(ctx, graph->nodes[first_unused]) &&
+            graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused] &&
+            ggml_check_edges(graph, first_unused + 1, topk_qsa_edges)) {
+            // The input view must remain allocated until the fused selection has read it.
+            add_pattern_alloc_deps(topk_qsa_coalesced_pattern,
+                    first_unused + (int) topk_qsa_coalesced_pattern.size() - 1);
+            keep_pattern(topk_qsa_coalesced_pattern);
+            continue;
+        }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
@@ -14818,9 +14876,13 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
             auto const &in_qsa_pattern = [&](int n) -> bool {
-                for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
-                    if (n - o >= 0 && match_pattern(topk_qsa_pattern, n - o)) {
-                        return true;
+                for (const auto & pattern : { topk_qsa_coalesced_pattern, topk_qsa_pattern }) {
+                    for (int o = 0; o < (int) pattern.size(); ++o) {
+                        if (n - o >= 0 && match_pattern(pattern, n - o) &&
+                            (pattern.size() == topk_qsa_pattern.size() ||
+                             ggml_vk_topk_qsa_coalesced_layout(ctx, graph->nodes[n - o]))) {
+                            return true;
+                        }
                     }
                 }
                 return false;
