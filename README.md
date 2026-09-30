@@ -6,6 +6,14 @@ This fork preserves a measured Qwen3.8 Flash Next configuration for Strix Halo 1
 
 Use branch `strix-checkpoint-004` or tag `checkpoint-004`. The inference source matches the frozen checkpoint. Other hardware and models have not been qualified. The upstream README follows below.
 
+| Configuration | 1,024-token PP | 1,024-token TG | 209,000-token PP | 209,000-token TG |
+| --- | ---: | ---: | ---: | ---: |
+| Official b11179, original settings | 323.03 | 23.73 | 154.62 | 7.58 |
+| Checkpoint 001: integrated patches and MTP | 457.02 | 38.10 | 300.15 | 30.46 |
+| Checkpoint 002: fewer copies | 457.85 | 38.54 | 361.03 | 30.28 |
+| Checkpoint 003: compact expert dispatch | 479.52 | 38.99 | 363.60 | 30.55 |
+| **Checkpoint 004: MTP cache-only catch-up** | **475.63** | **38.64** | **409.55** | **31.00** |
+
 ---
 
 # llama.cpp
