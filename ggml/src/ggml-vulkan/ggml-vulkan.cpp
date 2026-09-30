@@ -8047,6 +8047,46 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
 
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    // Sparse mask hint (op_params[4]): compact the <= n_kv_max finite positions and gather only those.
+    const int32_t n_kv_max = mask ? ggml_get_op_params_i32(dst, 4) : 0;
+    static const bool disable_sparse = getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
+    static const bool disable_sparse_prefill = getenv("GGML_VK_FA_SPARSE_PREFILL_DISABLE") != nullptr;
+    static const bool trace_sparse_prefill = getenv("GGML_VK_FA_SPARSE_PREFILL_TRACE") != nullptr;
+    const auto & limits = ctx->device->properties.limits;
+    const uint64_t sparse_prefill_bytes = sizeof(int32_t) * (uint64_t) std::max(n_kv_max, 0) * nem1;
+    bool sparse_prefill = false;
+    if (!disable_sparse_prefill && !disable_sparse && N > 8 &&
+        ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        qk_ratio > 1 && qk_ratio * nek2 == neq2 && nek2 == nev2 &&
+        neq3 == 1 && nek3 == 1 && nev3 == 1 &&
+        mask && mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) &&
+        nem0 == KV && nem1 >= N && nem2 == 1 && nem3 == 1 &&
+        max_bias == 0.0f && logit_softcap == 0.0f && n_kv_max > 0 &&
+        (int64_t) KV >= std::max<int64_t>(4096, 2 * (int64_t) n_kv_max) &&
+        nem1 <= limits.maxComputeWorkGroupCount[0] && nek2 <= limits.maxComputeWorkGroupCount[1] &&
+        sparse_prefill_bytes <= limits.maxStorageBufferRange &&
+        ggml_nbytes(q) <= UINT32_MAX && ggml_nbytes(k) <= UINT32_MAX &&
+        ggml_nbytes(v) <= UINT32_MAX && ggml_nbytes(mask) <= UINT32_MAX &&
+        ggml_nbytes(dst) <= UINT32_MAX) {
+        const auto params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, v->type, f32acc);
+        sparse_prefill = params.path == FA_COOPMAT1 &&
+                         qk_ratio <= std::min(params.block_rows, 32u) &&
+                         N <= UINT32_MAX / params.block_rows;
+    }
+
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
@@ -8068,7 +8108,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                 (uint64_t)ggml_nelements(k) <= f16_repack_max_elements &&
                                 (uint64_t)ggml_nelements(v) <= f16_repack_max_elements &&
                                 ((uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t)) % ctx->device->properties.limits.minStorageBufferOffsetAlignment == 0;
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_f16_strided) && neq1 >= 64 &&
+    // Sparse prefill gathers native F16 rows directly, so a full-cache repack is unnecessary.
+    const bool use_dequant_kv = !sparse_prefill && ((k_quant && v_quant) || kv_f16_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -8087,7 +8128,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // Each sparse-prefill workgroup handles one token's GQA heads and one mask row.
+    if ((N <= 8 || sparse_prefill) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -8099,21 +8141,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
-    float scale         = 1.0f;
-    float max_bias      = 0.0f;
-    float logit_softcap = 0.0f;
-
-    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
-    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-
-    if (logit_softcap != 0) {
-        scale /= logit_softcap;
-    }
-
-    // Sparse mask hint (op_params[4]): compact the <= n_kv_max finite positions and gather only those.
-    const int32_t n_kv_max = mask ? ggml_get_op_params_i32(dst, 4) : 0;
-    static const bool disable_sparse = getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
     // cm2 dense is fast, so it needs a larger reduction to win.
     const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : 2;
     const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
@@ -8122,6 +8149,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                             nem0 == KV &&
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
                             (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
+
+    if (sparse_prefill && trace_sparse_prefill) {
+        GGML_LOG_INFO("ggml_vulkan: sparse-prefill q=%u kv=%u gqa=%u mask_rows=%u budget=%d sparse=%d repack=%d\n",
+                (uint32_t) neq1, KV, gqa_ratio, nem1, n_kv_max, use_sparse, use_dequant_kv);
+    }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
