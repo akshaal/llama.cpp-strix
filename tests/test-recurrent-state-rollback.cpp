@@ -10,6 +10,8 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <vector>
@@ -302,13 +304,20 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
-static int test_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+static int test_rollback(const common_params & params, llama_model * model, uint8_t fill, uint32_t n_prompt = 0) {
+    const bool sparse_qsa = n_prompt > 0;
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
     // TODO: use smart pointers
     llama_context * ctx_src = make_ctx(params, model, fill);
+    if (sparse_qsa) {
+        common_set_env("LLAMA_QSA_NO_POOLED_CACHE", "1");
+    }
     llama_context * ctx_dst = make_ctx(params, model, fill);
+    if (sparse_qsa) {
+        common_set_env("LLAMA_QSA_NO_POOLED_CACHE", "");
+    }
     if (ctx_src == nullptr || ctx_dst == nullptr) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
@@ -318,7 +327,7 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         fprintf(stderr, "%s : skipping because n_rs_seq is disabled\n", __func__);
         llama_free(ctx_src);
         llama_free(ctx_dst);
-        return 0;
+        return sparse_qsa ? 1 : 0;
     }
 
     std::vector<llama_token> tokens;
@@ -333,13 +342,18 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
         llama_free(ctx_src);
         llama_free(ctx_dst);
-        return 0;
+        return sparse_qsa ? 1 : 0;
     }
     if (tokens.empty()) {
         fprintf(stderr, "%s : not enough prompt tokens\n", __func__);
         return 1;
     }
-    tokens.resize(n_rs_seq + 1, tokens.back());
+    tokens.resize(sparse_qsa ? n_prompt : n_rs_seq + 1, tokens.back());
+    if (sparse_qsa) {
+        for (uint32_t i = 0; i < n_prompt; ++i) {
+            tokens[i] = (llama_token) ((7*i + 1) % (uint32_t) n_vocab);
+        }
+    }
 
     const uint32_t  n_tokens     = tokens.size();
     const llama_pos rollback_pos = (llama_pos) n_tokens - n_rollback;
@@ -356,12 +370,20 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         return 1;
     }
 
+    if (sparse_qsa) {
+        // Reusing the rejected tokens could hide stale summaries of a completed block.
+        for (uint32_t i = (uint32_t) rollback_pos; i < n_tokens; ++i) {
+            tokens[i] = (tokens[i] + 1) % n_vocab;
+        }
+        fprintf(stderr, "%s : sparse QSA replacement from position %d, full-recompute reference\n", __func__, rollback_pos);
+    }
+
     // Save the rolled-back state and restore it into a fresh context.
     common_prompt_checkpoint ckpt;
     ckpt.update_tgt(ctx_src, 0, 0);
     ckpt.load_tgt(ctx_dst, 0, 0);
 
-    constexpr float nmse_eps = 0.0;
+    const float nmse_eps = sparse_qsa ? 1e-6f : 0.0f;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
     const auto replay_and_compare = [&](const char * mode) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
@@ -475,10 +497,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     llama_free(ctx_dst);
     llama_free(ctx_dirty);
 
-    if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
-        return 1;
-    }
-
     return 0;
 }
 
@@ -509,9 +527,38 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    const bool sparse_qsa = strcmp(arch, "qwen4exp") == 0;
+    if (sparse_qsa) {
+        const auto top_k = std::find_if(params.kv_overrides.begin(), params.kv_overrides.end(), [](const llama_model_kv_override & kv) {
+            return strcmp(kv.key, "qwen4exp.attention.indexer.top_k") == 0;
+        });
+        if (top_k == params.kv_overrides.end() || top_k->tag != LLAMA_KV_OVERRIDE_TYPE_INT ||
+            top_k->val_i64 <= 0 || top_k->val_i64 > 28 || top_k->val_i64 % 4 != 0) {
+            fprintf(stderr, "%s : QSA test needs a sparse budget, e.g. --override-kv qwen4exp.attention.indexer.top_k=int:8\n", __func__);
+            return 1;
+        }
+        if (std::getenv("LLAMA_QSA_NO_POOLED_CACHE") != nullptr) {
+            fprintf(stderr, "%s : unset LLAMA_QSA_NO_POOLED_CACHE; the test creates its own full-recompute reference\n", __func__);
+            return 1;
+        }
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     for (uint8_t fill : { 0, 0x3e }) {
         fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
-        if (test_rollback(params, model, fill) != 0) {
+        if (sparse_qsa) {
+            // Three-token rollback begins at 32, 33, 34 and 35; all have more keys than the sparse budget.
+            for (uint32_t n_prompt : { 35u, 36u, 37u, 38u }) {
+                if (test_rollback(params, model, fill, n_prompt) != 0) {
+                    return 1;
+                }
+            }
+        } else if (test_rollback(params, model, fill) != 0) {
+            return 1;
+        }
+        if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
             return 1;
         }
     }
