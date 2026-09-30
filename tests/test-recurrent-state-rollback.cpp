@@ -17,6 +17,9 @@
 #include <set>
 #include <vector>
 
+#include "raw-reset-preflight.h"
+#include "raw-cleared-spans.h"
+
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
     llama_batch batch = llama_batch_init(count, 0, 1);
     for (uint32_t pos = 0; pos < count; ++pos) {
@@ -537,6 +540,23 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
+    }
+
+    const char * spans_input = std::getenv("LLAMA_CLEARED_SPANS_INPUT");
+    const char * spans_output = std::getenv("LLAMA_CLEARED_SPANS_OUT");
+    if (spans_input || spans_output) {
+        if (!spans_input || !spans_output || std::getenv("LLAMA_RESET_PREFLIGHT_INPUT") ||
+                std::getenv("LLAMA_RESET_PREFLIGHT_OUT")) { return 1; }
+        ggml_backend_load_all();
+        return raw_cleared_spans(params, spans_input, spans_output);
+    }
+
+    const char * reset_input = std::getenv("LLAMA_RESET_PREFLIGHT_INPUT");
+    const char * reset_output = std::getenv("LLAMA_RESET_PREFLIGHT_OUT");
+    if (reset_input || reset_output) {
+        if (!reset_input || !reset_output) { return 1; }
+        ggml_backend_load_all();
+        return raw_reset_preflight(params, reset_input, reset_output);
     }
 
     ggml_backend_load_all();
