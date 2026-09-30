@@ -6010,6 +6010,130 @@ struct test_mul_mat_id_bounded : public test_mul_mat_id {
     }
 };
 
+// Serial compact-grid comparisons retain the ordinary CPU oracle and poison every replay output.
+struct test_mul_mat_id_compact : public test_mul_mat_id_bounded {
+    struct saved_input { ggml_tensor * tensor; std::vector<uint8_t> bytes; };
+    std::vector<saved_input> inputs;
+    ggml_tensor * ids_storage = nullptr;
+    unsigned cpu_checks = 0;
+
+    using test_mul_mat_id_bounded::test_mul_mat_id_bounded;
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_COMPACT"; }
+    bool run_whole_graph() override { return true; }
+
+    bool compare_with_cpu(ggml_tensor * node) override {
+        if (node->op == GGML_OP_MUL_MAT_ID) { ++cpu_checks; }
+        return true;
+    }
+
+    void set_compact_routes(bool changed) {
+        GGML_ASSERT(ids_storage != nullptr && n_used == 10);
+        const int counts[] = {0, 1, 63, 64, 65, 127, 128, 129, 511, 513};
+        std::vector<int32_t> row(n_mats);
+        for (int64_t token = 0; token < n; ++token) {
+            for (int slot = 0; slot < n_mats; ++slot) {
+                int expert = slot;
+                if (route == "duplicate" && slot < n_used) {
+                    expert = n_mats - 1;
+                } else if ((route == "balanced") != changed) {
+                    expert = int((token * n_used + slot) % n_mats);
+                } else if (!changed && route == "boundary" && slot < n_used) {
+                    expert = token < counts[slot] ? slot : n_used + slot;
+                }
+                // The permutation leaves gaps before, between and after hot experts.
+                row[slot] = (expert * 17 + (changed ? n_mats / 2 + 7 : 5)) % n_mats;
+            }
+            ggml_backend_tensor_set(ids_storage, row.data(), token * ids_storage->nb[1], row.size() * sizeof(row[0]));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        ids_storage = ggml_get_tensor(ctx, "ids");
+        set_compact_routes(false);
+        if (mode != MODE_TEST) { return; }
+        // Snapshot original storage and sentinels before the first backend execution.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) { continue; }
+            inputs.push_back({t, std::vector<uint8_t>(ggml_nbytes(t))});
+            ggml_backend_tensor_get(t, inputs.back().bytes.data(), 0, inputs.back().bytes.size());
+        }
+        ggml_tensor * out = ggml_get_tensor(ctx, "out");
+        GGML_ASSERT(out != nullptr);
+        const std::vector<float> poison(ggml_nelements(out), NAN);
+        ggml_backend_tensor_set(out, poison.data(), 0, ggml_nbytes(out));
+    }
+
+    bool inputs_unchanged() const {
+        std::array<uint8_t, 65536> part;
+        for (const auto & saved : inputs) {
+            for (size_t offset = 0; offset < saved.bytes.size(); offset += part.size()) {
+                const size_t bytes = std::min(part.size(), saved.bytes.size() - offset);
+                ggml_backend_tensor_get(saved.tensor, part.data(), offset, bytes);
+                if (memcmp(part.data(), saved.bytes.data() + offset, bytes) != 0) { return false; }
+            }
+        }
+        return true;
+    }
+
+    bool check_replays(ggml_backend_t backend, ggml_tensor * out) override {
+        test_gdn_pack_env enable("GGML_VK_MMQ_ID_COMPACT"), disable("GGML_VK_MMQ_ID_COMPACT_DISABLE");
+        const size_t bytes = ggml_nbytes(out);
+        std::vector<float> reference(ggml_nelements(out)), actual(reference.size()), poison(reference.size(), NAN);
+        ggml_backend_tensor_get(out, reference.data(), 0, bytes);
+        const auto finite = [](const std::vector<float> & values) {
+            return std::all_of(values.begin(), values.end(), [](float v) { return std::isfinite(v); });
+        };
+        if (cpu_checks != 1 || !finite(reference) || !inputs_unchanged()) { return false; }
+        fprintf(stderr, "mmq-compact baseline type=%s n=%" PRId64 " experts=%d route=%s cpu=1 inputs=exact finite=1\n",
+                ggml_type_name(type_a), n, n_mats, route.c_str());
+
+        const auto replay = [&](const char * phase, const char * flag, const char * disabled, bool replace) {
+            common_set_env("GGML_VK_MMQ_ID_COMPACT", flag);
+            common_set_env("GGML_VK_MMQ_ID_COMPACT_DISABLE", disabled);
+            fprintf(stderr, "mmq-compact begin type=%s m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                    " experts=%d route=%s phase=%s\n", ggml_type_name(type_a), m, n, k, n_mats, route.c_str(), phase);
+            ggml_backend_tensor_set(out, poison.data(), 0, bytes);
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { return false; }
+            ggml_backend_tensor_get(out, actual.data(), 0, bytes);
+            if (!finite(actual) || !inputs_unchanged()) { return false; }
+            if (replace) {
+                if (memcmp(actual.data(), reference.data(), bytes) == 0) { return false; }
+                reference = actual;
+            } else if (memcmp(actual.data(), reference.data(), bytes) != 0) {
+                fprintf(stderr, "mmq-compact byte mismatch phase=%s\n", phase);
+                return false;
+            }
+            fprintf(stderr, "mmq-compact end phase=%s result=ok reference=%s inputs=exact finite=1\n",
+                    phase, replace ? "changed-old-grid" : "exact");
+            return true;
+        };
+        if (route == "duplicate") {
+            // The old grid can omit duplicate-slot routes. Use the CPU-checked compact result only.
+            return replay("duplicate-repeat1", "1", "", false) && replay("duplicate-repeat2", "1", "", false);
+        }
+        if (!replay("old", "1", "0", false) || !replay("compact", "1", "", false) ||
+                !replay("compact-repeat", "1", "", false)) { return false; }
+        if (route == "config") {
+            if (!replay("unset", "", "", false) || !replay("zero", "0", "", false) ||
+                    !replay("invalid", "1x", "", false)) { return false; }
+        }
+        set_compact_routes(true);
+        bool ids_changed = false;
+        for (auto & saved : inputs) {
+            if (saved.tensor != ids_storage) { continue; }
+            std::vector<uint8_t> updated(saved.bytes.size());
+            ggml_backend_tensor_get(saved.tensor, updated.data(), 0, updated.size());
+            ids_changed = updated != saved.bytes;
+            saved.bytes = std::move(updated);
+        }
+        if (!ids_changed) { return false; }
+        return replay("changed-old", "1", "0", true) && replay("changed-compact", "1", "", false) &&
+               replay("changed-repeat", "1", "", false);
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -13248,6 +13372,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id_bounded(GGML_TYPE_Q4_K, 512, true, 640, 2048, 2560, route));
         test_cases.emplace_back(new test_mul_mat_id_bounded(GGML_TYPE_Q5_1, 512, false, 2560, 2048, 640, route));
     }
+    if (getenv("GGML_TEST_MMQ_ID_COMPACT") != nullptr) {
+        for (const char * route : { "balanced", "hot" }) {
+            test_cases.emplace_back(new test_mul_mat_id_compact(GGML_TYPE_Q4_K, 512, true, 640, 2048, 2560, route));
+            test_cases.emplace_back(new test_mul_mat_id_compact(GGML_TYPE_Q5_1, 512, false, 2560, 2048, 640, route));
+        }
+    }
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
@@ -13731,6 +13861,41 @@ static bool run_mmq_id_bounded_slice(ggml_backend_t backend, ggml_backend_t back
     return n_fail == 0;
 }
 
+static bool run_mmq_id_compact_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+        const char * op_names_filter, const char * params_filter, printer * output_printer) {
+    if (getenv("GGML_TEST_MMQ_ID_COMPACT") == nullptr ||
+            !op_names_filter_selects(op_names_filter, "MUL_MAT_ID_COMPACT")) { return true; }
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0) { return true; }
+    test_gdn_pack_env enable("GGML_VK_MMQ_ID_COMPACT"), disable("GGML_VK_MMQ_ID_COMPACT_DISABLE");
+    std::vector<test_mul_mat_id_compact> cases = {
+        { GGML_TYPE_Q4_K, 512, true,  640, 129, 2560, "balanced" },
+        { GGML_TYPE_Q5_1, 512, false, 2560, 129, 640, "balanced" },
+        { GGML_TYPE_Q4_K, 16,  true,  640, 2048, 2560, "hot" },
+        { GGML_TYPE_Q5_1, 16,  false, 2560, 2048, 640, "hot" },
+        { GGML_TYPE_Q4_K, 32,  false, 128, 513, 256, "boundary" },
+        { GGML_TYPE_Q5_1, 32,  true,  128, 513, 256, "boundary" },
+        { GGML_TYPE_Q4_K, 16,  true,  128, 513, 256, "config" },
+        { GGML_TYPE_F16,  16,  true,  128, 257, 256, "hot" },
+        { GGML_TYPE_Q4_K, 1032, true, 128, 256, 256, "hot" },
+        { GGML_TYPE_Q4_K, 16,  true,  128, 9, 256, "small" },
+        { GGML_TYPE_Q4_K, 16,  true,  128, 129, 256, "duplicate" },
+    };
+    int n_run = 0, n_fail = 0;
+    for (auto & tc : cases) {
+        if (params_filter && !std::regex_search(tc.vars(), std::regex(params_filter))) { continue; }
+        common_set_env("GGML_VK_MMQ_ID_COMPACT", "1");
+        common_set_env("GGML_VK_MMQ_ID_COMPACT_DISABLE", "");
+        fprintf(stderr, "mmq-compact case type=%s m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                " experts=%d route=%s\n", ggml_type_name(tc.type_a), tc.m, tc.n, tc.k, tc.n_mats, tc.route.c_str());
+        const auto status = tc.eval(backend, backend_cpu, "MUL_MAT_ID_COMPACT", output_printer);
+        ++n_run;
+        n_fail += status != test_status_t::OK;
+    }
+    fprintf(stderr, "mmq-compact slice: %d cases run, %d failed\n", n_run, n_fail);
+    return n_fail == 0;
+}
+
 static bool run_fa_masked_tail_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
         const char * op_names_filter, const char * params_filter, printer * output_printer) {
     if (!getenv("GGML_TEST_FA_MASKED_TAIL") || !op_names_filter_selects(op_names_filter, "FLASH_ATTN_MASKED_TAIL")) {
@@ -14038,12 +14203,13 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
         const bool mmq_id_ok = run_mmq_id_bounded_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
+        const bool compact_ok = run_mmq_id_compact_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
         const bool masked_tail_ok = run_fa_masked_tail_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
         const bool mask_guard_ok = run_fa_mask_guard_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
         const bool pv_precision_ok = run_fa_pv_precision_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
         const bool captured_replay_ok = run_fa_captured_replay_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
         const bool gdn_pack_ok = run_gdn_subgroup_pack_slice(backend, backend_cpu.get(), op_names_filter, params_filter, output_printer);
-        return n_ok == tests_run && slice_ok && mmq_id_ok && masked_tail_ok && mask_guard_ok && pv_precision_ok && captured_replay_ok && gdn_pack_ok;
+        return n_ok == tests_run && slice_ok && mmq_id_ok && compact_ok && masked_tail_ok && mask_guard_ok && pv_precision_ok && captured_replay_ok && gdn_pack_ok;
     }
 
     if (mode == MODE_GRAD) {

@@ -63,7 +63,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
     uint32_t n_experts;
-    uint32_t hoist_row_ids;
+    uint32_t hoist_row_ids; // bit 0: hoisted rows, bit 1: compact CM1 integer grid
 };
 
 struct vk_mat_vec_id_push_constants {
@@ -217,6 +217,7 @@ struct vk_op_count_experts_push_constants {
     uint32_t hoist_row_ids;
     uint32_t ne00mp;
     uint32_t ne00L;
+    uint32_t tile_n; // zero keeps the original table layout
 };
 
 struct vk_op_glu_push_constants {

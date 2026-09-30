@@ -175,9 +175,29 @@ void main() {
     const uint ik = gl_WorkGroupID.x / blocks_m;
 
 #ifdef MUL_MAT_ID
-    const uint ic = gl_WorkGroupID.y;
+    uint ic = gl_WorkGroupID.y;
     const uint ir = gl_WorkGroupID.x % blocks_m;
-    const uint expert_idx = gl_WorkGroupID.z;
+    uint expert_idx = gl_WorkGroupID.z;
+    if ((p.hoist_row_ids & 2u) != 0) {
+        const uint prefix = 2 * p.n_experts + 1 + p.nei0 * p.nei1;
+        const uint tile = gl_WorkGroupID.y;
+        // This condition is uniform across the workgroup and precedes row-ID loads.
+        if (tile >= uint(data_expert_count[prefix + p.n_experts])) {
+            return;
+        }
+        uint first = 0;
+        uint last = p.n_experts;
+        while (first < last) {
+            const uint middle = first + (last - first) / 2;
+            if (uint(data_expert_count[prefix + middle + 1]) <= tile) {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        expert_idx = first;
+        ic = tile - uint(data_expert_count[prefix + expert_idx]);
+    }
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }

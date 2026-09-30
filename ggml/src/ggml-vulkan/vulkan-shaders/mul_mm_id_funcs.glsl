@@ -80,8 +80,9 @@ void load_row_ids_hoisted(uint expert_idx, uint ic) {
     const uint expert_offset = uint(data_expert_count[p.n_experts + expert_idx]);
     const uint row_ids_offset = 2 * p.n_experts + 1 + expert_offset + tile_begin;
 
-    for (uint i = gl_LocalInvocationIndex; i < tile_count; i += BLOCK_SIZE) {
-        const uint packed_row_id = uint(data_expert_count[row_ids_offset + i]);
+    // CM1 prefetch reads every column. Repeat a valid row in unused columns.
+    for (uint i = gl_LocalInvocationIndex; i < BN; i += BLOCK_SIZE) {
+        const uint packed_row_id = tile_count > 0 ? uint(data_expert_count[row_ids_offset + (i < tile_count ? i : 0)]) : 0;
         row_ids[i] = u16vec2(packed_row_id & 0xffffu, packed_row_id >> 16);
     }
     barrier();

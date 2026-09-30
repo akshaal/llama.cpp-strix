@@ -1957,7 +1957,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     auto const &ggml_vk_create_pipeline = [&](vk_device& device, vk_pipeline& base_pipeline, const char *name, size_t spv_size, const void* spv_data, const char *entrypoint,
                                               uint32_t parameter_count, uint32_t push_constant_size, std::array<uint32_t, 3> wg_denoms, const std::vector<uint32_t>& specialization_constants,
-                                              uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0) {
+                                              uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0,
+                                              bool compact_expert_grid = false) {
 
         if (!require_full_subgroups && required_subgroup_size == 0) {
             required_subgroup_size = get_subgroup_size(name, device->architecture);
@@ -1982,6 +1983,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 pipeline->push_constant_size = push_constant_size;
                 pipeline->wg_denoms = wg_denoms;
                 pipeline->align = align;
+                pipeline->compact_expert_grid = compact_expert_grid;
                 pipeline->initialized = true;
 #if defined(VK_EXT_shader_64bit_indexing)
                 pipeline->is_64b_indexing = (i == 1);
@@ -2206,7 +2208,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         uint32_t push_constant_size, uint32_t param_count,
         const spec_fn_t& spec_fn,
         bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0,
-        bool create_aligned = true, bool pin_subgroup_to_warp = false
+        bool create_aligned = true, bool pin_subgroup_to_warp = false, bool compact_expert_grid = false
     ) {
         auto& vec = device->pipeline_matmul[key];
         const bool first_call = vec.empty();
@@ -2232,14 +2234,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 vec[i].unaligned->name.empty() ? (shader_name + "_" + std::to_string(i)).c_str() : vec[i].unaligned->name.c_str(),
                 spv_len, spv_data, "main", param_count, push_constant_size,
                 tc.wg_denoms, spec_fn(tc.warptile, false), 1,
-                disable_robustness, rfs, rsgs);
+                disable_robustness, rfs, rsgs, compact_expert_grid);
 
             if (vec[i].aligned) {
                 ggml_vk_create_pipeline(device, vec[i].aligned,
                     vec[i].aligned->name.empty() ? (shader_name + "_aligned_" + std::to_string(i)).c_str() : vec[i].aligned->name.c_str(),
                     spv_len, spv_data, "main", param_count, push_constant_size,
                     tc.wg_denoms, spec_fn(tc.warptile, true), tc.align,
-                    disable_robustness, rfs, rsgs);
+                    disable_robustness, rfs, rsgs, compact_expert_grid);
             }
         }
     };
@@ -2404,7 +2406,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                   const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             spec_fn_t identity = [](const std::vector<uint32_t>& wt, bool) { return wt; };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id, true);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, identity, false, false, 0, false, true);
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, identity, false, false, 0, false, true, key.mul_mat_id);
         };
 
         std::vector<vk_tile_config> tc_mmq_cm1_int = {
@@ -5985,14 +5987,26 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        bool hoist_row_ids) {
+        bool hoist_row_ids, uint32_t compact_groups) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids) };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+                                              nei0, nei1, nbi1, ne11, n_as,
+                                              uint32_t(hoist_row_ids) | (compact_groups ? 2u : 0u) };
+    const uint32_t tile_n = pipeline->wg_denoms[1];
+    const uint32_t dispatch_n = compact_groups ? compact_groups * tile_n : nei1;
+    const uint32_t dispatch_z = compact_groups ? 1u : n_as;
+    if (getenv("GGML_VK_MMQ_ID_COMPACT_TRACE") != nullptr) {
+        GGML_LOG_INFO("ggml_vulkan: mmq-id-compact pipeline=%s m=%u n=%u k=%u experts=%u used=%u tile_n=%u rows=%llu original_y=%u launched_y=%u launched_z=%u compatible=%u hoisted=%u compact=%u table_bytes=%llu\n",
+                pipeline->name.c_str(), m, nei1, k, n_as, nei0, tile_n,
+                (unsigned long long) nei0 * nei1, nei1 / tile_n + (nei1 % tile_n != 0),
+                dispatch_n / tile_n + (dispatch_n % tile_n != 0), dispatch_z,
+                uint32_t(pipeline->compact_expert_grid), uint32_t(hoist_row_ids), uint32_t(compact_groups != 0),
+                (unsigned long long) expert_count_buf.size);
+    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, dispatch_n, dispatch_z });
 }
 
 bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -7398,6 +7412,26 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
+    // Select the compact table only after the final pipeline (including 64-bit indexing).
+    uint32_t compact_groups = 0;
+    const char * compact_env = getenv("GGML_VK_MMQ_ID_COMPACT");
+    const uint32_t tile_n = pipeline->wg_denoms[1];
+    const uint64_t compact_words = hoisted_row_id_words + n_as + 1;
+    if (compact_env != nullptr && strcmp(compact_env, "1") == 0 &&
+            getenv("GGML_VK_MMQ_ID_COMPACT_DISABLE") == nullptr &&
+            ctx->device->vendor_id == VK_VENDOR_ID_AMD && pipeline->compact_expert_grid &&
+            hoist_row_ids && n_as > 0 && nei0 > 0 && nei1 > 0 && tile_n > 0 &&
+            pipeline->wg_denoms[2] == 1 && compact_words <= UINT32_MAX &&
+            compact_words <= ctx->device->properties.limits.maxStorageBufferRange / sizeof(uint32_t)) {
+        const uint64_t rows = nei0 * nei1;
+        const uint64_t old_groups = n_as * (nei1 / tile_n + (nei1 % tile_n != 0));
+        const uint64_t upper = std::min(rows, n_as + rows / tile_n + (rows % tile_n != 0) - 1);
+        // Each nonempty expert adds at most one partial tile. Extra groups return uniformly.
+        if (upper < old_groups && upper <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+                upper <= (UINT32_MAX - (tile_n - 1u)) / tile_n) {
+            compact_groups = uint32_t(upper);
+        }
+    }
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * ne11 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
@@ -7449,7 +7483,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
     const size_t expert_data_size = sizeof(uint32_t) *
-        (hoist_row_ids ? hoisted_row_id_words : n_as);
+        (compact_groups ? compact_words : (hoist_row_ids ? hoisted_row_id_words : n_as));
 
     {
         if (
@@ -7544,7 +7578,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            (uint32_t)n_as,
                                            uint32_t(hoist_row_ids),
-                                           0, 0 };
+                                           0, 0, compact_groups ? tile_n : 0u };
         init_pushconst_fastdiv(pc);
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
@@ -7621,7 +7655,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids, compact_groups
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {

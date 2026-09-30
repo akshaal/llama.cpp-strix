@@ -251,6 +251,8 @@ struct vk_pipeline_struct {
     uint32_t parameter_count;
     std::array<uint32_t, 3> wg_denoms;
     uint32_t align;
+    // Only CM1 integer expert shaders understand the compact-grid flag.
+    bool compact_expert_grid {};
     // true if fields have been set by ggml_vk_create_pipeline
     bool initialized {};
     // true while a compile is in flight, used to dedupe concurrent claims.
